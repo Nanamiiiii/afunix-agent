@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish GitHub release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      installer_sha256: ${{ steps.package.outputs.installer_sha256 }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_VERSION: "1.98.1"
+      TARGET: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION `
+            --profile minimal `
+            --component clippy,rustfmt `
+            --no-self-update
+          rustup default $env:RUST_VERSION
+
+      - name: Verify tag and package version
+        id: version
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:TAG -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$') {
+            throw "Release tags must use the form vX.Y.Z or vX.Y.Z-prerelease."
+          }
+
+          $version = $Matches.version
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object name -EQ "afunix-agent"
+          if ($null -eq $package) {
+            throw "The afunix-agent package was not found in cargo metadata."
+          }
+          if ($package.version -ne $version) {
+            throw "Tag version $version does not match Cargo.toml version $($package.version)."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$($version.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installerName = "afunix-agent-$env:TARGET.exe"
+          $archiveName = "afunix-agent-$env:TARGET.zip"
+          $dist = New-Item -ItemType Directory -Force dist
+          $staging = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\afunix-agent"
+
+          Copy-Item target\release\afunix-agent.exe "$dist\$installerName"
+          Copy-Item target\release\afunix-agent.exe "$staging\afunix-agent.exe"
+          Copy-Item README.md, LICENSE $staging
+          Compress-Archive -Path "$staging\*" -DestinationPath "$dist\$archiveName"
+
+          $installerHash = (Get-FileHash "$dist\$installerName" -Algorithm SHA256).Hash
+          $archiveHash = (Get-FileHash "$dist\$archiveName" -Algorithm SHA256).Hash
+          "$($installerHash.ToLowerInvariant())  $installerName" |
+            Set-Content "$dist\$installerName.sha256" -Encoding utf8NoBOM
+          "$($archiveHash.ToLowerInvariant())  $archiveName" |
+            Set-Content "$dist\$archiveName.sha256" -Encoding utf8NoBOM
+
+          & .\target\release\afunix-agent.exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "The release binary failed its version smoke test."
+          }
+
+          "installer_sha256=$installerHash" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object FullName
+
+          & gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $env:TAG @assets --clobber
+          } else {
+            $arguments = @(
+              "release", "create", $env:TAG,
+              "--verify-tag",
+              "--title", "afunix-agent $env:VERSION",
+              "--generate-notes"
+            )
+            if ($env:PRERELEASE -eq "true") {
+              $arguments += "--prerelease"
+            }
+            $arguments += $assets
+            & gh @arguments
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to publish GitHub release $env:TAG."
+          }
+
+  winget:
+    name: Submit WinGet manifest
+    needs: release
+    if: needs.release.outputs.prerelease == 'false'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+      VERSION: ${{ needs.release.outputs.version }}
+      INSTALLER_SHA256: ${{ needs.release.outputs.installer_sha256 }}
+      INSTALLER_NAME: afunix-agent-x86_64-pc-windows-msvc.exe
+      REPOSITORY: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify WinGet token
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw "Add a classic PAT with public_repo scope as the WINGET_CREATE_GITHUB_TOKEN repository secret."
+          }
+
+      - name: Generate WinGet manifests
+        shell: pwsh
+        run: |
+          $installerUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:TAG/$env:INSTALLER_NAME"
+          .\scripts\New-WinGetManifests.ps1 `
+            -PackageVersion $env:VERSION `
+            -InstallerUrl $installerUrl `
+            -InstallerSha256 $env:INSTALLER_SHA256 `
+            -OutputDirectory .\winget-manifests
+
+      - name: Submit manifest to microsoft/winget-pkgs
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe submit .\winget-manifests `
+            --prtitle "Submit Nanamiiiii.afunix-agent version $env:VERSION" `
+            --no-open

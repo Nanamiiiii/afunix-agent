@@ -10,6 +10,18 @@ by GnuPG `gpg-agent` with `enable-putty-support`.
 - GnuPG `gpg-agent` configured with `enable-putty-support`
 - Rust 1.98.1 or later when building from source
 
+## Installation
+
+Install the latest stable release with WinGet:
+
+```powershell
+winget install --exact --id Nanamiiiii.afunix-agent
+```
+
+Alternatively, download the Windows x64 archive from
+[GitHub Releases](https://github.com/Nanamiiiii/afunix-agent/releases), extract it,
+and place `afunix-agent.exe` on `PATH`.
+
 ## Build
 
 ```powershell
@@ -53,6 +65,29 @@ $env:SSH_AUTH_SOCK = afunix-agent socket
 ```
 
 The default socket is `%USERPROFILE%\.ssh\ssh-agent.sock`.
+
+## Release process
+
+The `.github/workflows/release.yml` workflow runs for tags named `vX.Y.Z` or
+`vX.Y.Z-prerelease`. The tag version must exactly match the package version in
+`Cargo.toml`.
+
+Before publishing the first stable release, add a repository Actions secret named
+`WINGET_CREATE_GITHUB_TOKEN`. It must contain a GitHub personal access token
+(classic) with the `public_repo` scope; fine-grained tokens are not supported by
+`wingetcreate`. The token is used only to create a pull request in
+[`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs).
+
+To publish a release:
+
+1. Update the version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`.
+2. Commit the version change.
+3. Create and push the matching tag, for example `v0.1.0`.
+
+The workflow checks formatting, tests, and Clippy before building the Windows x64
+binary. It publishes the executable, a ZIP archive, and SHA-256 checksum files to
+a GitHub Release. Stable versions also generate and submit the WinGet manifests;
+prerelease versions skip WinGet submission.
 
 ## GnuPG configuration
 
