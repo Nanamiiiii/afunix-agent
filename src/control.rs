@@ -105,10 +105,10 @@ pub fn wait_for_ready(
     let started = Instant::now();
 
     loop {
-        if let Some(child) = child.as_deref_mut() {
-            if let Some(status) = child.try_wait().map_err(ControlError::ChildStatus)? {
-                return Err(ControlError::ChildExited(status));
-            }
+        if let Some(child) = child.as_deref_mut()
+            && let Some(status) = child.try_wait().map_err(ControlError::ChildStatus)?
+        {
+            return Err(ControlError::ChildExited(status));
         }
 
         if let Ok(response) = send_request(&ControlRequest::Status) {

@@ -8,7 +8,7 @@ by GnuPG `gpg-agent` with `enable-putty-support`.
 
 - Windows 10 version 1803 or later
 - GnuPG `gpg-agent` configured with `enable-putty-support`
-- Rust 1.85 or later when building from source
+- Rust 1.98.1 or later when building from source
 
 ## Build
 
