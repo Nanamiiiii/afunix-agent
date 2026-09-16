@@ -36,6 +36,9 @@ Start the background daemon:
 afunix-agent start
 ```
 
+The background daemon does not retain the caller's redirected input/output
+pipes, so capturing the output of `start` does not wait for the daemon to stop.
+
 Run it in the foreground:
 
 ```powershell

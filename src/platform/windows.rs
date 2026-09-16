@@ -4,9 +4,9 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
+use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::ExitStatus;
 use std::ptr;
 
 use std::thread;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    GetLastError, HANDLE, HLOCAL, LocalFree,
+    GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -37,10 +37,58 @@ use windows::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CreateMutexW, DETACHED_PROCESS, GetCurrentProcess, OpenProcess,
-    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    CREATE_NEW_PROCESS_GROUP, CreateMutexW, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+    use windows::Win32::Foundation::ERROR_BROKEN_PIPE;
+    use windows::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+
+    #[test]
+    #[ignore = "helper process for the detached spawn test"]
+    fn detached_child() {
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn detached_child_does_not_inherit_pipe_writer() {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe { CreatePipe(&mut read, &mut write, Some(&attributes), 0) }.unwrap();
+        let read = unsafe { owned_handle(read) };
+        let write = unsafe { owned_handle(write) };
+        let mut child = spawn_detached_current_exe([
+            "--ignored",
+            "--exact",
+            "platform::windows::spawn_tests::detached_child",
+        ])
+        .unwrap();
+        drop(write);
+
+        let result =
+            unsafe { PeekNamedPipe(HANDLE(read.as_raw_handle()), None, 0, None, None, None) };
+        let running = child.try_wait();
+        let _ = child.kill();
+        child.wait().unwrap();
+
+        assert!(running.unwrap().is_none(), "child must still be running");
+        assert_eq!(
+            result.unwrap_err().code(),
+            HRESULT::from_win32(ERROR_BROKEN_PIPE.0)
+        );
+    }
+}
 
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 const PIPE_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -289,19 +337,185 @@ fn verify_named_pipe_server(pipe: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub fn spawn_detached_current_exe<I, S>(args: I) -> io::Result<Child>
+#[derive(Debug)]
+pub struct DetachedChild {
+    process: OwnedHandle,
+    id: u32,
+}
+
+impl DetachedChild {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        match unsafe { TerminateProcess(HANDLE(self.process.as_raw_handle()), 1) } {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self.try_wait()?.is_some() {
+                    Ok(())
+                } else {
+                    Err(windows_error("failed to terminate detached process", error))
+                }
+            }
+        }
+    }
+
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.wait_for_exit(INFINITE)?.ok_or_else(|| {
+            io::Error::other("infinite wait for detached process unexpectedly timed out")
+        })
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.wait_for_exit(0)
+    }
+
+    fn wait_for_exit(&self, timeout: u32) -> io::Result<Option<ExitStatus>> {
+        let process = HANDLE(self.process.as_raw_handle());
+        match unsafe { WaitForSingleObject(process, timeout) } {
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                unsafe { GetExitCodeProcess(process, &mut code) }.map_err(|error| {
+                    windows_error("failed to read detached process exit code", error)
+                })?;
+                Ok(Some(ExitStatus::from_raw(code)))
+            }
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other("unexpected detached process wait result")),
+        }
+    }
+}
+
+fn append_quoted_arg(command_line: &mut Vec<u16>, arg: &OsStr) -> io::Result<()> {
+    let arg: Vec<u16> = arg.encode_wide().collect();
+    if arg.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process argument contains an embedded NUL",
+        ));
+    }
+    command_line.push(b'"' as u16);
+    let mut backslashes = 0;
+    for unit in arg {
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        // CRT parsing halves backslashes before quotes, including the closing quote.
+        let count = if unit == b'"' as u16 {
+            backslashes * 2 + 1
+        } else {
+            backslashes
+        };
+        command_line.extend(std::iter::repeat_n(b'\\' as u16, count));
+        command_line.push(unit);
+        backslashes = 0;
+    }
+    command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    command_line.push(b'"' as u16);
+    Ok(())
+}
+
+pub fn spawn_detached_current_exe<I, S>(args: I) -> io::Result<DetachedChild>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let flags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).0;
-    Command::new(std::env::current_exe()?)
-        .args(args)
-        .creation_flags(flags)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let executable = std::env::current_exe()?;
+    let application = to_wide(executable.as_os_str())?;
+    let mut command_line = Vec::new();
+    // argv[0] has special CRT parsing, but an executable file path cannot contain
+    // quotes or end in a backslash, so ordinary quoting is also correct here.
+    append_quoted_arg(&mut command_line, executable.as_os_str())?;
+    for arg in args {
+        command_line.push(b' ' as u16);
+        append_quoted_arg(&mut command_line, arg.as_ref())?;
+    }
+    command_line.push(0);
+    if command_line.len() > 32_767 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process command line exceeds the Windows UTF-16 length limit",
+        ));
+    }
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: HANDLE::default(),
+        hStdOutput: HANDLE::default(),
+        hStdError: HANDLE::default(),
+        ..Default::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut information,
+        )
+    }
+    .map_err(|error| windows_error("failed to spawn detached process", error))?;
+    let process = unsafe { owned_handle(information.hProcess) };
+    let thread = unsafe { owned_handle(information.hThread) };
+    drop(thread);
+    Ok(DetachedChild {
+        process,
+        id: information.dwProcessId,
+    })
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn quotes_crt_arguments() {
+        for (input, expected) in [
+            ("", "\"\""),
+            ("plain", "\"plain\""),
+            ("space and\ttab", "\"space and\ttab\""),
+            (r#"a"b"#, r#""a\"b""#),
+            (r"a\b", r#""a\b""#),
+            (r"a\", r#""a\\""#),
+            (r#"a\"b"#, r#""a\\\"b""#),
+            (r#"a\\"b"#, r#""a\\\\\"b""#),
+            ("日本語😀", "\"日本語😀\""),
+        ] {
+            let mut actual = Vec::new();
+            append_quoted_arg(&mut actual, OsStr::new(input)).unwrap();
+            assert_eq!(
+                actual,
+                expected.encode_utf16().collect::<Vec<_>>(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_unpaired_utf16_surrogates() {
+        let mut actual = Vec::new();
+        append_quoted_arg(&mut actual, &OsString::from_wide(&[0xd800])).unwrap();
+        assert_eq!(actual, [b'"' as u16, 0xd800, b'"' as u16]);
+    }
+
+    #[test]
+    fn rejects_embedded_nul_without_appending() {
+        let mut actual = vec![42];
+        let error = append_quoted_arg(&mut actual, OsStr::new("a\0b")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(actual, [42]);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

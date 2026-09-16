@@ -1,5 +1,5 @@
 use std::io::{self, BufReader, Read, Write};
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use crate::control_protocol::{
 };
 use crate::lifecycle::Lifecycle;
 use crate::model::DaemonStatus;
-use crate::platform::{NamedPipeServer, control_pipe_name, open_named_pipe_client};
+use crate::platform::{DetachedChild, NamedPipeServer, control_pipe_name, open_named_pipe_client};
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,7 +100,7 @@ pub fn wake_control_server() -> Result<(), ControlError> {
 
 pub fn wait_for_ready(
     timeout: Duration,
-    mut child: Option<&mut Child>,
+    mut child: Option<&mut DetachedChild>,
 ) -> Result<DaemonStatus, ControlError> {
     let started = Instant::now();
 
