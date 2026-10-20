@@ -136,46 +136,46 @@ jobs:
             throw "Failed to publish GitHub release $env:TAG."
           }
 
-#  winget:
-#    name: Submit WinGet manifest
-#    needs: release
-#    if: needs.release.outputs.prerelease == 'false'
-#    runs-on: windows-latest
-#    permissions:
-#      contents: read
-#    env:
-#      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
-#      VERSION: ${{ needs.release.outputs.version }}
-#      INSTALLER_SHA256: ${{ needs.release.outputs.installer_sha256 }}
-#      INSTALLER_NAME: afunix-agent-x86_64-pc-windows-msvc.exe
-#      REPOSITORY: ${{ github.repository }}
-#      TAG: ${{ github.ref_name }}
-#
-#    steps:
-#      - name: Check out repository
-#        uses: actions/checkout@v4
-#
-#      - name: Verify WinGet token
-#        shell: pwsh
-#        run: |
-#          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
-#            throw "Add a classic PAT with public_repo scope as the WINGET_CREATE_GITHUB_TOKEN repository secret."
-#          }
-#
-#      - name: Generate WinGet manifests
-#        shell: pwsh
-#        run: |
-#          $installerUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:TAG/$env:INSTALLER_NAME"
-#          .\scripts\New-WinGetManifests.ps1 `
-#            -PackageVersion $env:VERSION `
-#            -InstallerUrl $installerUrl `
-#            -InstallerSha256 $env:INSTALLER_SHA256 `
-#            -OutputDirectory .\winget-manifests
-#
-#      - name: Submit manifest to microsoft/winget-pkgs
-#        shell: pwsh
-#        run: |
-#          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-#          .\wingetcreate.exe submit .\winget-manifests `
-#            --prtitle "Submit Nanamiiiii.afunix-agent version $env:VERSION" `
-#            --no-open
+  winget:
+    name: Submit WinGet manifest
+    needs: release
+    if: needs.release.outputs.prerelease == 'false'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+      VERSION: ${{ needs.release.outputs.version }}
+      INSTALLER_SHA256: ${{ needs.release.outputs.installer_sha256 }}
+      INSTALLER_NAME: afunix-agent-x86_64-pc-windows-msvc.exe
+      REPOSITORY: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify WinGet token
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw "Add a classic PAT with public_repo scope as the WINGET_CREATE_GITHUB_TOKEN repository secret."
+          }
+
+      - name: Generate WinGet manifests
+        shell: pwsh
+        run: |
+          $installerUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:TAG/$env:INSTALLER_NAME"
+          .\scripts\New-WinGetManifests.ps1 `
+            -PackageVersion $env:VERSION `
+            -InstallerUrl $installerUrl `
+            -InstallerSha256 $env:INSTALLER_SHA256 `
+            -OutputDirectory .\winget-manifests
+
+      - name: Submit manifest to microsoft/winget-pkgs
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe submit .\winget-manifests `
+            --prtitle "Submit Nanamiiiii.afunix-agent version $env:VERSION" `
+            --no-open
